@@ -8,6 +8,9 @@ const TOKEN_KEY = 'planning_douleur_token';
 const USER_KEY = 'planning_douleur_user';
 
 let db = null;
+let syncTimer = null;
+let syncPromise = null;
+let syncAgain = false;
 
 let state = {
   token: localStorage.getItem(TOKEN_KEY),
@@ -454,11 +457,21 @@ async function bootstrapAfterLogin() {
 
   try {
     await loadCatalogsFromServer();
-    await sync();
+    const ok = await sync();
+
+    if (!ok && state.token) {
+      scheduleSync(5000);
+    }
+
     render();
   } catch (error) {
+    console.error('Chargement initial :', error);
     setStatus('Mode hors ligne');
     render();
+
+    if (state.token) {
+      scheduleSync(5000);
+    }
   }
 }
 
@@ -489,7 +502,7 @@ function getEntry(date = selectedDate()) {
   return state.entries[date];
 }
 
-function setPain(categoryId, level) {
+async function setPain(categoryId, level) {
   const entry = getEntry();
 
   const value = Math.max(
@@ -539,11 +552,12 @@ function setPain(categoryId, level) {
     },
   );
 
-  saveLocalState();
+  await saveLocalState();
   render();
+  scheduleSync();
 }
 
-function toggleActivity(
+async function toggleActivity(
   activityTypeId,
   checked,
 ) {
@@ -596,8 +610,9 @@ function toggleActivity(
     },
   );
 
-  saveLocalState();
+  await saveLocalState();
   render();
+  scheduleSync();
 }
 
 /* ============================================================
@@ -672,60 +687,96 @@ async function pushPending() {
 }
 
 async function pullChanges() {
+  const pendingChanges = [];
+  let nextCursor = state.cursor;
+
   while (true) {
     const response = await api(
-      `/sync?cursor=${state.cursor}`,
+      `/sync?cursor=${nextCursor}`,
     );
 
-    for (const change of
-      response.changes || []) {
-      applyRemoteChange(change);
-    }
+    pendingChanges.push(
+      ...(response.changes || []),
+    );
 
-    state.cursor =
-      Number(
-        response.nextCursor ??
-        state.cursor,
-      );
-
-    await saveLocalState();
+    nextCursor = Number(
+      response.nextCursor ?? nextCursor,
+    );
 
     if (!response.hasMore) {
       break;
     }
   }
+
+  for (const change of orderChanges(pendingChanges)) {
+    applyRemoteChange(change);
+  }
+
+  state.cursor = nextCursor;
+  await saveLocalState();
 }
 
-async function sync() {
-  if (!state.token) {
-    return;
+function scheduleSync(delay = 500) {
+  if (!state.token) return;
+
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    const ok = await sync();
+
+    if (!ok && state.token) {
+      scheduleSync(5000);
+    }
+  }, delay);
+}
+
+function sync() {
+  if (syncPromise) {
+    syncAgain = true;
+    return syncPromise;
   }
+
+  syncPromise = (async () => {
+    let success = true;
+
+    do {
+      syncAgain = false;
+      success = await performSync();
+    } while (syncAgain && state.token && navigator.onLine);
+
+    return success;
+  })().finally(() => {
+    syncPromise = null;
+
+    if (syncAgain && state.token) {
+      scheduleSync(0);
+    }
+  });
+
+  return syncPromise;
+}
+
+async function performSync() {
+  if (!state.token) return true;
 
   if (!navigator.onLine) {
     setStatus('Hors ligne');
-    return;
+    render();
+    return false;
   }
 
   try {
     setStatus('Synchronisation...');
-
     await pushPending();
     await pullChanges();
-
     setStatus('Synchronisé');
-
+    render();
+    return true;
   } catch (error) {
-    console.error(
-      'Synchronisation:',
-      error,
-    );
-
-    setStatus(
-      'Synchronisation en attente',
-    );
+    console.error('Synchronisation:', error);
+    setStatus('Synchronisation en attente');
+    render();
+    return false;
   }
-
-  render();
 }
 
 function applyRemoteChange(change) {
@@ -1371,12 +1422,30 @@ async function main() {
   render();
 }
 
-window.addEventListener(
-  'online',
-  () => {
-    sync();
-  },
-);
+window.addEventListener('online', () => {
+  scheduleSync(0);
+});
+
+window.addEventListener('focus', () => {
+  scheduleSync(0);
+});
+
+// Récupère régulièrement les changements des autres appareils.
+setInterval(() => {
+  if (
+    state.token &&
+    navigator.onLine &&
+    document.visibilityState === 'visible'
+  ) {
+    scheduleSync(0);
+  }
+}, 30000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    scheduleSync(0);
+  }
+});
 
 window.addEventListener(
   'DOMContentLoaded',
